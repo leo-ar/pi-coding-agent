@@ -230,6 +230,16 @@ For backward search: go to current input (nil index)."
 
 ;;;; Input Mode
 
+(defun pi-coding-agent--input-kill-buffer-query ()
+  "Ask before killing input when its linked chat owns a live process."
+  (let ((proc (and (buffer-live-p pi-coding-agent--chat-buffer)
+                   (buffer-local-value 'pi-coding-agent--process
+                                       pi-coding-agent--chat-buffer))))
+    (or (not (and (processp proc)
+                  (process-live-p proc)
+                  (process-query-on-exit-flag proc)))
+        (yes-or-no-p "Pi session has a running process; kill it? "))))
+
 (define-derived-mode pi-coding-agent-input-mode text-mode "Pi-Input"
   "Major mode for composing pi prompts.
 Defaults to plain `text-mode'.  Set
@@ -252,6 +262,8 @@ markdown highlighting while preserving mode identity and keybindings."
   (add-hook 'completion-at-point-functions #'pi-coding-agent--path-capf nil t)
   (add-hook 'post-self-insert-hook #'pi-coding-agent--maybe-complete-at nil t)
   (add-hook 'isearch-mode-hook #'pi-coding-agent--history-isearch-setup nil t)
+  (add-hook 'kill-buffer-query-functions
+            #'pi-coding-agent--input-kill-buffer-query nil t)
   (add-hook 'kill-buffer-hook #'pi-coding-agent--cleanup-input-on-kill nil t))
 
 ;;;; Input-Buffer Chat Navigation
