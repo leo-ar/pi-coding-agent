@@ -551,9 +551,44 @@ CONTENT is ignored - we use what was already streamed."
                (pi-coding-agent--adjust-pos-after-region-replacements
                 pos replacements)))))))))
 
+(defconst pi-coding-agent--followup-drain-delay 0.05
+  "Seconds to wait after agent_end before draining local follow-ups.
+Pi may emit post-run compaction or retry events immediately after agent_end;
+this short delay lets those events claim ordering before Emacs sends a local
+follow-up as a fresh prompt.")
+
+(defun pi-coding-agent--cancel-followup-drain-timer ()
+  "Cancel any pending local follow-up queue drain timer."
+  (when (timerp pi-coding-agent--followup-drain-timer)
+    (cancel-timer pi-coding-agent--followup-drain-timer))
+  (setq pi-coding-agent--followup-drain-timer nil))
+
+(defun pi-coding-agent--ready-to-drain-followups-p ()
+  "Return non-nil when a queued follow-up may become the next prompt."
+  (and pi-coding-agent--followup-queue
+       (eq pi-coding-agent--status 'idle)
+       (not (pi-coding-agent--prompt-start-wait-active-p))
+       (null pi-coding-agent--local-user-message)))
+
+(defun pi-coding-agent--drain-followup-queue-if-idle (buffer)
+  "Drain BUFFER's follow-up queue only if the session is still idle."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq pi-coding-agent--followup-drain-timer nil)
+      (when (pi-coding-agent--ready-to-drain-followups-p)
+        (pi-coding-agent--process-followup-queue)))))
+
+(defun pi-coding-agent--schedule-followup-queue-processing ()
+  "Schedule local follow-up queue processing after post-run events settle."
+  (when (pi-coding-agent--ready-to-drain-followups-p)
+    (pi-coding-agent--cancel-followup-drain-timer)
+    (setq pi-coding-agent--followup-drain-timer
+          (run-at-time pi-coding-agent--followup-drain-delay nil
+                       #'pi-coding-agent--drain-followup-queue-if-idle
+                       (current-buffer)))))
+
 (defun pi-coding-agent--display-agent-end ()
-  "Finalize agent turn: normalize whitespace, handle abort, process queue.
-Note: status is set to `idle' by the event handler."
+  "Finalize agent turn: normalize whitespace, handle abort, schedule queue."
   ;; Reset per-turn state for clean next turn.
   (setq pi-coding-agent--local-user-message nil)
   (setq pi-coding-agent--in-thinking-block nil)
@@ -580,11 +615,13 @@ Note: status is set to `idle' by the event handler."
           (skip-chars-backward "\n")
           (delete-region (point) (point-max))
           (insert "\n"))))
-    (pi-coding-agent--set-activity-phase "idle")
+    (pi-coding-agent--set-activity-phase
+     (if (eq pi-coding-agent--status 'sending) "thinking" "idle"))
     (pi-coding-agent--refresh-header)
-    ;; Check follow-up queue and send next message if any (unless aborted)
+    ;; Give immediate post-run compaction/retry events a chance to arrive before
+    ;; turning a local follow-up into a new independent prompt.
     (unless was-aborted
-      (pi-coding-agent--process-followup-queue))))
+      (pi-coding-agent--schedule-followup-queue-processing))))
 
 (defun pi-coding-agent--dispatch-builtin-command (text)
   "Try to dispatch TEXT as a built-in slash command.
@@ -608,32 +645,116 @@ Returns non-nil if TEXT matched a built-in command and was handled."
             (_ (funcall handler)))
           t)))))
 
-(defun pi-coding-agent--prepare-and-send (text)
+(defun pi-coding-agent--prepare-and-send (text &optional queued)
   "Prepare chat buffer state and send TEXT to pi.
 Built-in slash commands are dispatched locally via the dispatch table.
-Other slash commands (extensions, skills, prompts) are sent to pi.
-Regular text is displayed locally for responsiveness, then sent.
-Must be called with chat buffer current.
-Status transitions are handled by pi events (agent_start, agent_end)."
+Other slash commands (extensions, skills, prompts) are sent to pi without
+local transcript display.  Regular text is displayed after prompt preflight
+accepts it.
+When QUEUED is non-nil, TEXT is the oldest local follow-up and is removed
+from the queue only after prompt preflight succeeds.
+Must be called with chat buffer current.  Pi events own streaming/idle turn
+transitions; prompt submission marks the local pre-event window as busy."
   (pi-coding-agent--invalidate-history-loads)
   (cond
-   ;; Built-in slash commands: dispatch locally
+   ;; Built-in slash commands are interactive client actions, not durable queued
+   ;; prompts.  Busy input refuses new ones; this guard keeps stale queued items
+   ;; from running later out of context.
+   ((and queued (pi-coding-agent--builtin-command-text-p text))
+    (pi-coding-agent--restore-followup-queue-to-input)
+    (message "Pi: Cannot run queued /%s command automatically"
+             (pi-coding-agent--builtin-command-name text)))
+   ;; Built-in slash commands: dispatch locally.
    ((pi-coding-agent--dispatch-builtin-command text))
-   ;; Other slash commands: don't display locally, send to pi
+   ;; Other slash commands: don't display locally, send to pi.
    ((string-prefix-p "/" text)
-    (pi-coding-agent--send-prompt text))
-   ;; Regular text: display locally for responsiveness, then send
+    (pi-coding-agent--send-prompt
+     text
+     (when queued
+       (lambda () (pi-coding-agent--drop-followup text)))
+     (if queued
+         #'pi-coding-agent--restore-followup-queue-to-input
+       (lambda () (pi-coding-agent--restore-input-text text)))
+     #'pi-coding-agent--schedule-followup-queue-processing))
+   ;; Regular text is displayed only after prompt preflight accepts it.  That
+   ;; keeps rejected prompts out of the transcript and lets us restore them to
+   ;; the input buffer for user recovery.
+   (queued
+    (pi-coding-agent--send-prompt
+     text
+     (lambda ()
+       (when (pi-coding-agent--drop-followup text)
+         (pi-coding-agent--display-user-message text (current-time))
+         (setq pi-coding-agent--local-user-message text)
+         (setq pi-coding-agent--assistant-header-shown nil)))
+     #'pi-coding-agent--restore-followup-queue-to-input
+     #'pi-coding-agent--schedule-followup-queue-processing))
    (t
-    (pi-coding-agent--display-user-message text (current-time))
-    (setq pi-coding-agent--local-user-message text)
-    (setq pi-coding-agent--assistant-header-shown nil)
-    (pi-coding-agent--send-prompt text))))
+    (pi-coding-agent--send-prompt
+     text
+     (lambda ()
+       (pi-coding-agent--display-user-message text (current-time))
+       (setq pi-coding-agent--local-user-message text)
+       (setq pi-coding-agent--assistant-header-shown nil))
+     (lambda () (pi-coding-agent--restore-input-text text))
+     #'pi-coding-agent--schedule-followup-queue-processing))))
 
 (defun pi-coding-agent--process-followup-queue ()
-  "Dequeue and send the oldest follow-up message.
-Does nothing if queue is empty.  Messages are processed in FIFO order."
-  (when-let* ((text (pi-coding-agent--dequeue-followup)))
-    (pi-coding-agent--prepare-and-send text)))
+  "Send the oldest follow-up only when it is safe to become the next prompt.
+Messages are processed in FIFO order and dropped only after preflight accepts
+them."
+  (when (pi-coding-agent--ready-to-drain-followups-p)
+    (when-let* ((text (pi-coding-agent--peek-followup)))
+      (pi-coding-agent--prepare-and-send text 'queued))))
+
+(defun pi-coding-agent--display-compaction-failure (error-message)
+  "Display failed compaction ERROR-MESSAGE without changing the queue."
+  (let ((error-text (or (pi-coding-agent--normalize-string-or-null error-message)
+                        "unknown error")))
+    (pi-coding-agent--display-error (format "Compaction failed: %s" error-text))
+    (message "Pi: Compaction failed: %s" error-text)))
+
+(defun pi-coding-agent--post-compaction-activity-phase ()
+  "Return activity phase after a compaction_end event."
+  (if (or (eq pi-coding-agent--status 'sending)
+          (pi-coding-agent--prompt-start-wait-active-p))
+      "thinking"
+    "idle"))
+
+(defun pi-coding-agent--handle-compaction-end-event (event)
+  "Display canonical compaction_end EVENT and manage follow-up queues.
+Status transitions are handled by `pi-coding-agent--update-state-from-event'."
+  (let ((result (pi-coding-agent--compaction-result-from-event event)))
+    (cond
+     ((pi-coding-agent--normalize-boolean (plist-get event :aborted))
+      (pi-coding-agent--set-activity-phase
+       (pi-coding-agent--post-compaction-activity-phase))
+      (message "Pi: Compaction cancelled")
+      ;; Clear queue on abort (user wanted to stop).
+      (pi-coding-agent--clear-followup-queue))
+     (result
+      (pi-coding-agent--handle-compaction-success
+       (plist-get result :tokensBefore)
+       (plist-get result :summary)
+       (pi-coding-agent--ms-to-time (plist-get result :timestamp)))
+      (if (eq pi-coding-agent--status 'sending)
+          (progn
+            ;; Pi is either retrying automatically or resuming a prompt whose
+            ;; preflight compacted first.  Keep local follow-ups behind that
+            ;; Pi-owned work.
+            (pi-coding-agent--set-activity-phase "thinking"))
+        (pi-coding-agent--set-activity-phase "idle")
+        (pi-coding-agent--schedule-followup-queue-processing)))
+     (t
+      (pi-coding-agent--set-activity-phase
+       (pi-coding-agent--post-compaction-activity-phase))
+      (pi-coding-agent--display-compaction-failure
+       (plist-get event :errorMessage))
+      ;; During prompt preflight, Pi reports compaction failure before the
+      ;; prompt RPC failure that owns the original prompt text.  Restore local
+      ;; follow-ups now; the prompt callback clears the wait and restores the
+      ;; direct prompt if Pi rejects it.
+      (pi-coding-agent--restore-followup-queue-to-input)))))
 
 (defun pi-coding-agent--display-retry-start (event)
   "Display retry notice from auto_retry_start EVENT.
@@ -865,6 +986,8 @@ Note: This runs from `kill-buffer-hook', which executes AFTER the kill
 decision is made.  For proper cancellation support, use `pi-coding-agent-quit'
 which asks upfront before any buffers are touched."
   (when (derived-mode-p 'pi-coding-agent-chat-mode)
+    (pi-coding-agent--cancel-followup-drain-timer)
+    (pi-coding-agent--invalidate-prompt-start-wait)
     (when pi-coding-agent--process
       (pi-coding-agent--unregister-display-handler pi-coding-agent--process)
       (when (process-live-p pi-coding-agent--process)
@@ -892,13 +1015,16 @@ which asks upfront before any buffers are touched."
         (kill-buffer chat-buf)))))
 
 (defun pi-coding-agent--register-display-handler (process)
-  "Register display event handler for PROCESS."
-  (let ((handler (pi-coding-agent--make-display-handler process)))
-    (process-put process 'pi-coding-agent-display-handler handler)))
+  "Register display and process-exit handlers for PROCESS."
+  (process-put process 'pi-coding-agent-display-handler
+               (pi-coding-agent--make-display-handler process))
+  (process-put process 'pi-coding-agent-exit-handler
+               (pi-coding-agent--make-process-exit-handler process)))
 
 (defun pi-coding-agent--unregister-display-handler (process)
-  "Unregister display event handler for PROCESS."
-  (process-put process 'pi-coding-agent-display-handler nil))
+  "Unregister display and process-exit handlers for PROCESS."
+  (process-put process 'pi-coding-agent-display-handler nil)
+  (process-put process 'pi-coding-agent-exit-handler nil))
 
 (defun pi-coding-agent--make-display-handler (process)
   "Create a display event handler for PROCESS."
@@ -907,6 +1033,31 @@ which asks upfront before any buffers are touched."
       (when (buffer-live-p chat-buf)
         (with-current-buffer chat-buf
           (pi-coding-agent--handle-display-event event))))))
+
+(defun pi-coding-agent--make-process-exit-handler (process)
+  "Create a frontend cleanup handler for PROCESS exit."
+  (lambda (response)
+    (when-let* ((chat-buf (process-get process 'pi-coding-agent-chat-buffer))
+                ((buffer-live-p chat-buf)))
+      (with-current-buffer chat-buf
+        (pi-coding-agent--mark-process-exited process response)))))
+
+(defun pi-coding-agent--mark-process-exited (process response)
+  "Mark current chat buffer idle after PROCESS exits with RESPONSE."
+  (setq pi-coding-agent--status 'idle)
+  (setq pi-coding-agent--state-timestamp (float-time))
+  (setq pi-coding-agent--state
+        (plist-put pi-coding-agent--state :last-error
+                   (plist-get response :error)))
+  (when (eq pi-coding-agent--process process)
+    (pi-coding-agent--set-process nil))
+  (pi-coding-agent--set-activity-phase "idle")
+  (setq pi-coding-agent--local-user-message nil)
+  (setq pi-coding-agent--pre-compaction-status nil)
+  (pi-coding-agent--cancel-followup-drain-timer)
+  (pi-coding-agent--invalidate-prompt-start-wait)
+  (pi-coding-agent--restore-followup-queue-to-input)
+  (force-mode-line-update t))
 
 (defun pi-coding-agent--display-custom-message (content)
   "Display visible custom CONTENT in the current chat buffer."
@@ -926,6 +1077,8 @@ Updates buffer-local state and renders display updates."
   ;; Then handle display
   (pcase (plist-get event :type)
     ("agent_start"
+     (pi-coding-agent--invalidate-prompt-start-wait)
+     (pi-coding-agent--cancel-followup-drain-timer)
      (pi-coding-agent--display-agent-start))
     ("message_start"
      (let* ((message (plist-get event :message))
@@ -1042,27 +1195,15 @@ Updates buffer-local state and renders display updates."
      (pi-coding-agent--display-tool-update
       (plist-get event :partialResult)
       (pi-coding-agent--tool-block-get (plist-get event :toolCallId))))
-    ("auto_compaction_start"
-     (setq pi-coding-agent--status 'compacting)
+    ("compaction_start"
+     (pi-coding-agent--cancel-followup-drain-timer)
      (pi-coding-agent--set-activity-phase "compact")
-     (let ((reason (plist-get event :reason)))
-       (message "Pi: %sAuto-compacting... (C-c C-k to cancel)"
-                (if (equal reason "overflow") "Context overflow, " ""))))
-    ("auto_compaction_end"
-     (setq pi-coding-agent--status 'idle)
-     (pi-coding-agent--set-activity-phase "idle")
-     (if (pi-coding-agent--normalize-boolean (plist-get event :aborted))
-         (progn
-           (message "Pi: Auto-compaction cancelled")
-           ;; Clear queue on abort (user wanted to stop)
-           (pi-coding-agent--clear-followup-queue))
-       (when-let* ((result (plist-get event :result)))
-         (pi-coding-agent--handle-compaction-success
-          (plist-get result :tokensBefore)
-          (plist-get result :summary)
-          (pi-coding-agent--ms-to-time (plist-get result :timestamp))))
-       ;; Process followup queue after successful compaction
-       (pi-coding-agent--process-followup-queue)))
+     (message (if (equal (plist-get event :reason) "overflow")
+                  "Pi: Context overflow, compacting..."
+                "Pi: Compacting...")))
+    ("compaction_end"
+     (pi-coding-agent--cancel-followup-drain-timer)
+     (pi-coding-agent--handle-compaction-end-event event))
     ("agent_end"
      (pi-coding-agent--set-canonical-messages
       (plist-get pi-coding-agent--state :messages))
@@ -1070,9 +1211,13 @@ Updates buffer-local state and renders display updates."
      (pi-coding-agent--update-hot-tail-boundary)
      (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail))
     ("auto_retry_start"
+     (pi-coding-agent--cancel-followup-drain-timer)
      (pi-coding-agent--display-retry-start event))
     ("auto_retry_end"
-     (pi-coding-agent--display-retry-end event))
+     (pi-coding-agent--display-retry-end event)
+     (unless (eq (plist-get event :success) t)
+       (pi-coding-agent--set-activity-phase "idle")
+       (pi-coding-agent--restore-followup-queue-to-input)))
     ("extension_error"
      (pi-coding-agent--display-extension-error event))
     ("extension_ui_request"
@@ -2430,7 +2575,7 @@ TIMESTAMP is optional time when compaction occurred."
       (pi-coding-agent--decorate-tables-in-region start (point-max)))))
 
 (defun pi-coding-agent--handle-compaction-success (tokens-before summary &optional timestamp)
-  "Handle successful compaction: display result, reset state, notify user.
+  "Handle successful compaction: display result and notify user.
 TOKENS-BEFORE is the pre-compaction token count.
 SUMMARY is the compaction summary text.
 TIMESTAMP is optional time when compaction occurred."

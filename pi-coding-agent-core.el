@@ -241,14 +241,17 @@ containing EVENT, then clears this process's pending request tables."
                   (when stderr
                     (list :stderr stderr)))))
     (unwind-protect
-        (progn
-          (when pending
-            (maphash (lambda (_id callback)
-                       (funcall callback error-response))
-                     pending)
-            (clrhash pending))
-          (when pending-types
-            (clrhash pending-types)))
+        (unwind-protect
+            (progn
+              (when pending
+                (maphash (lambda (_id callback)
+                           (funcall callback error-response))
+                         pending)
+                (clrhash pending))
+              (when pending-types
+                (clrhash pending-types)))
+          (when-let* ((handler (process-get proc 'pi-coding-agent-exit-handler)))
+            (funcall handler error-response)))
       (pi-coding-agent--cleanup-process-stderr-buffer proc))))
 
 (defvar pi-coding-agent-executable)  ; forward decl — core.el cannot require ui.el
@@ -287,14 +290,27 @@ Returns the process object."
 
 (defvar-local pi-coding-agent--status 'idle
   "Current status of the pi session (buffer-local in chat buffer).
-One of: `idle', `streaming', `compacting'.
+One of: `idle', `sending', `streaming', `compacting'.
 This is the single source of truth for session activity state.
 
-Status transitions are driven by events from pi:
-- `idle' -> `streaming' on agent_start
-- `streaming' -> `idle' on agent_end
-- `idle' -> `compacting' on auto_compaction_start
-- `compacting' -> `idle' on auto_compaction_end")
+Runtime status transitions are driven by events from pi:
+- `idle' or `sending' -> `streaming' on agent_start
+- `streaming' -> `sending' on agent_end with willRetry
+- `streaming' -> `idle' on agent_end without retry
+- `idle' -> `compacting' on compaction_start
+- `compacting' -> `sending' on successful compaction_end with willRetry
+- `compacting' -> `sending' on successful compaction_end that resumes
+  prompt preflight
+- `compacting' -> `idle' on compaction_end without retry, failure, or abort
+
+Local commands may mark a session busy before the first event arrives,
+for example normal prompt submission and manual compaction during the
+RPC pre-event window.")
+
+(defvar-local pi-coding-agent--pre-compaction-status nil
+  "Status that was active before a compaction event sequence.
+Used to restore local prompt submission state when Pi compacts during prompt
+preflight before the agent turn has started.")
 
 (defvar-local pi-coding-agent--state nil
   "Current state of the pi session (buffer-local in chat buffer).
@@ -310,7 +326,7 @@ A plist with keys like :model, :thinking-level, :messages, etc.")
   "Return t if state should be verified with get_state.
 Verification is needed when:
 - State and timestamp exist
-- Session is idle (not streaming or compacting)
+- Session status is `idle'
 - Timestamp is older than `pi-coding-agent--state-verify-interval' seconds."
   (and pi-coding-agent--state
        pi-coding-agent--state-timestamp
@@ -340,10 +356,33 @@ Use when reading JSON fields that may be null or string.
 JSON null (:null) and non-strings become nil."
   (and (stringp value) value))
 
+(defun pi-coding-agent--compaction-result-from-event (event)
+  "Return EVENT's successful compaction result, or nil when absent."
+  (let ((result (plist-get event :result)))
+    (unless (or (null result)
+                (pi-coding-agent--json-null-p result))
+      result)))
+
+(defun pi-coding-agent--compaction-end-success-p (event)
+  "Return non-nil when EVENT reports a completed, non-aborted compaction."
+  (and (not (pi-coding-agent--normalize-boolean (plist-get event :aborted)))
+       (not (null (pi-coding-agent--compaction-result-from-event event)))))
+
+(defun pi-coding-agent--compaction-end-will-retry-p (event)
+  "Return non-nil when EVENT indicates Pi will retry after compaction.
+A retry is only considered pending for a successful compaction result;
+failed or aborted compactions must not leave the session busy."
+  (and (pi-coding-agent--normalize-boolean (plist-get event :willRetry))
+       (pi-coding-agent--compaction-end-success-p event)))
+
+(defun pi-coding-agent--compaction-end-resumes-preflight-p (event)
+  "Return non-nil when EVENT can resume a pre-compaction prompt."
+  (and (eq pi-coding-agent--pre-compaction-status 'sending)
+       (pi-coding-agent--compaction-end-success-p event)))
+
 (defun pi-coding-agent--update-state-from-event (event)
   "Update status and state based on EVENT.
-Handles agent lifecycle, message events, and error/retry events.
-Sets status to `streaming' on agent_start, `idle' on agent_end."
+Handles agent lifecycle, message events, compaction, and error/retry events."
   (let ((type (plist-get event :type)))
     (pcase type
       ("agent_start"
@@ -352,7 +391,10 @@ Sets status to `streaming' on agent_start, `idle' on agent_end."
        (plist-put pi-coding-agent--state :last-error nil)
        (setq pi-coding-agent--state-timestamp (float-time)))
       ("agent_end"
-       (setq pi-coding-agent--status 'idle)
+       (setq pi-coding-agent--status
+             (if (pi-coding-agent--normalize-boolean (plist-get event :willRetry))
+                 'sending
+               'idle))
        (plist-put pi-coding-agent--state :is-retrying nil)
        (plist-put pi-coding-agent--state :messages (plist-get event :messages))
        (setq pi-coding-agent--state-timestamp (float-time)))
@@ -366,13 +408,33 @@ Sets status to `streaming' on agent_start, `idle' on agent_end."
        (pi-coding-agent--handle-tool-update event))
       ("tool_execution_end"
        (pi-coding-agent--handle-tool-end event))
+      ("compaction_start"
+       (setq pi-coding-agent--pre-compaction-status
+             (unless (eq pi-coding-agent--status 'compacting)
+               pi-coding-agent--status))
+       (setq pi-coding-agent--status 'compacting)
+       (setq pi-coding-agent--state-timestamp (float-time)))
+      ("compaction_end"
+       (setq pi-coding-agent--status
+             (cond
+              ((pi-coding-agent--compaction-end-will-retry-p event)
+               'sending)
+              ((pi-coding-agent--compaction-end-resumes-preflight-p event)
+               'sending)
+              (t
+               'idle)))
+       (setq pi-coding-agent--pre-compaction-status nil)
+       (setq pi-coding-agent--state-timestamp (float-time)))
       ("auto_retry_start"
+       (setq pi-coding-agent--status 'sending)
        (plist-put pi-coding-agent--state :is-retrying t)
        (plist-put pi-coding-agent--state :retry-attempt (plist-get event :attempt))
        (plist-put pi-coding-agent--state :last-error (plist-get event :errorMessage)))
       ("auto_retry_end"
        (plist-put pi-coding-agent--state :is-retrying nil)
        (unless (eq (plist-get event :success) t)
+         (when (eq pi-coding-agent--status 'sending)
+           (setq pi-coding-agent--status 'idle))
          (plist-put pi-coding-agent--state :last-error (plist-get event :finalError))))
       ("extension_error"
        (plist-put pi-coding-agent--state :last-error (plist-get event :error))))))

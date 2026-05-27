@@ -46,6 +46,11 @@
   (let ((result (pi-coding-agent--parse-json-line "{\"isStreaming\":false}")))
     (should (eq (plist-get result :isStreaming) :false))))
 
+(ert-deftest pi-coding-agent-test-parse-json-null ()
+  "JSON null parses to :null, not nil."
+  (let ((result (pi-coding-agent--parse-json-line "{\"result\":null}")))
+    (should (eq (plist-get result :result) :null))))
+
 (ert-deftest pi-coding-agent-test-json-false-p-accepts-both-sentinels ()
   "JSON false helper accepts both parser and encoder sentinels."
   (should (pi-coding-agent--json-false-p :false))
@@ -160,6 +165,19 @@
           (should received)
           (should (eq (plist-get received :success) :false))
           (should (plist-get received :error)))
+      (ignore-errors (delete-process fake-proc)))))
+
+(ert-deftest pi-coding-agent-test-process-exit-runs-exit-handler-after-callbacks ()
+  "Process exit lets pending callbacks recover input before frontend cleanup."
+  (let ((events nil)
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (let ((pending (pi-coding-agent--get-pending-requests fake-proc)))
+          (puthash "req_1" (lambda (_r) (push 'callback events)) pending)
+          (process-put fake-proc 'pi-coding-agent-exit-handler
+                       (lambda (_r) (push 'exit-handler events)))
+          (pi-coding-agent--handle-process-exit fake-proc "finished\n")
+          (should (equal (reverse events) '(callback exit-handler))))
       (ignore-errors (delete-process fake-proc)))))
 
 ;;;; Response Dispatch Tests
@@ -325,6 +343,14 @@
     (pi-coding-agent--update-state-from-event '(:type "agent_end" :messages []))
     (should (eq pi-coding-agent--status 'idle))))
 
+(ert-deftest pi-coding-agent-test-event-agent-end-will-retry-keeps-sending ()
+  "agent_end with willRetry keeps the session busy for Pi's retry."
+  (let ((pi-coding-agent--status 'streaming)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event
+     '(:type "agent_end" :messages [] :willRetry t))
+    (should (eq pi-coding-agent--status 'sending))))
+
 (ert-deftest pi-coding-agent-test-event-agent-end-stores-messages ()
   "agent_end event stores messages in state."
   (let ((pi-coding-agent--status 'streaming)
@@ -391,6 +417,97 @@ Display is handled by the display handler, not by state updates."
        :isError :false))
     (should (null (gethash "call_123" tools)))))
 
+(ert-deftest pi-coding-agent-test-event-compaction-start-sets-compacting ()
+  "compaction_start event sets pi-coding-agent--status to compacting."
+  (let ((pi-coding-agent--status 'idle)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event '(:type "compaction_start" :reason "threshold"))
+    (should (eq pi-coding-agent--status 'compacting))))
+
+(ert-deftest pi-coding-agent-test-event-compaction-end-sets-idle ()
+  "compaction_end event sets pi-coding-agent--status to idle."
+  (let ((pi-coding-agent--status 'compacting)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event '(:type "compaction_end" :reason "threshold" :aborted :false))
+    (should (eq pi-coding-agent--status 'idle))))
+
+(ert-deftest pi-coding-agent-test-event-compaction-end-will-retry-sets-sending ()
+  "Successful compaction_end with willRetry keeps the session busy."
+  (let ((pi-coding-agent--status 'compacting)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_end"
+       :reason "overflow"
+       :aborted :false
+       :willRetry t
+       :result (:tokensBefore 1000 :summary "Summary")))
+    (should (eq pi-coding-agent--status 'sending))))
+
+(ert-deftest pi-coding-agent-test-event-compaction-end-will-retry-without-result-sets-idle ()
+  "willRetry without a result is not a retrying success."
+  (let ((pi-coding-agent--status 'compacting)
+        (pi-coding-agent--pre-compaction-status nil)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_end"
+       :reason "overflow"
+       :aborted :false
+       :willRetry t
+       :result :null
+       :errorMessage "recovery failed"))
+    (should (eq pi-coding-agent--status 'idle))))
+
+(ert-deftest pi-coding-agent-test-event-compaction-preserves-prompt-preflight-sending ()
+  "Successful compaction during prompt preflight resumes that prompt."
+  (let ((pi-coding-agent--status 'sending)
+        (pi-coding-agent--pre-compaction-status nil)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_start" :reason "threshold"))
+    (should (eq pi-coding-agent--status 'compacting))
+    (should (eq pi-coding-agent--pre-compaction-status 'sending))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_end"
+       :reason "threshold"
+       :aborted :false
+       :willRetry :false
+       :result (:tokensBefore 1000 :summary "Summary")))
+    (should (eq pi-coding-agent--status 'sending))
+    (should (null pi-coding-agent--pre-compaction-status))))
+
+(ert-deftest pi-coding-agent-test-event-failed-compaction-does-not-resume-preflight-sending ()
+  "Failed compaction during prompt preflight settles instead of faking retry."
+  (let ((pi-coding-agent--status 'sending)
+        (pi-coding-agent--pre-compaction-status nil)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_start" :reason "threshold"))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_end"
+       :reason "threshold"
+       :aborted :false
+       :willRetry :false
+       :result :null
+       :errorMessage "quota exceeded"))
+    (should (eq pi-coding-agent--status 'idle))
+    (should (null pi-coding-agent--pre-compaction-status))))
+
+(ert-deftest pi-coding-agent-test-event-aborted-compaction-does-not-resume-preflight-sending ()
+  "Aborted compaction during prompt preflight is stop-everything, not sending."
+  (let ((pi-coding-agent--status 'sending)
+        (pi-coding-agent--pre-compaction-status nil)
+        (pi-coding-agent--state nil))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_start" :reason "threshold"))
+    (pi-coding-agent--update-state-from-event
+     '(:type "compaction_end"
+       :reason "threshold"
+       :aborted t
+       :willRetry :false
+       :result nil))
+    (should (eq pi-coding-agent--status 'idle))
+    (should (null pi-coding-agent--pre-compaction-status))))
+
 (ert-deftest pi-coding-agent-test-ensure-active-tools-from-nil ()
   "pi-coding-agent--ensure-active-tools works when pi-coding-agent--state is nil."
   (let ((pi-coding-agent--state nil))
@@ -448,6 +565,13 @@ Display is handled by the display handler, not by state updates."
   (let ((pi-coding-agent--status 'streaming)
         (pi-coding-agent--state (list :model "test"))
         (pi-coding-agent--state-timestamp (- (float-time) 60)))  ;; Old, but streaming
+    (should (not (pi-coding-agent--state-needs-verification-p)))))
+
+(ert-deftest pi-coding-agent-test-state-no-verify-while-sending ()
+  "State does not need verification while waiting for agent_start."
+  (let ((pi-coding-agent--status 'sending)
+        (pi-coding-agent--state (list :model "test"))
+        (pi-coding-agent--state-timestamp (- (float-time) 60)))
     (should (not (pi-coding-agent--state-needs-verification-p)))))
 
 (ert-deftest pi-coding-agent-test-state-no-verify-when-no-timestamp ()

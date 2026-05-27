@@ -179,7 +179,7 @@ from either chat or input buffer."
                    (lambda (response)
                      (let* ((data (plist-get response :data))
                             (cancelled (plist-get data :cancelled)))
-                       (if (and (plist-get response :success)
+                       (if (and (eq (plist-get response :success) t)
                                 (pi-coding-agent--json-false-p cancelled))
                            (when (buffer-live-p chat-buf)
                              (with-current-buffer chat-buf
@@ -213,7 +213,7 @@ When cached state has no session file, fetch fresh state from PROC first."
       (funcall callback session-dir)
     (pi-coding-agent--rpc-async proc '(:type "get_state")
       (lambda (response)
-        (when (and (plist-get response :success)
+        (when (and (eq (plist-get response :success) t)
                    (buffer-live-p chat-buf))
           (pi-coding-agent--apply-state-response chat-buf response))
         (when (buffer-live-p chat-buf)
@@ -326,6 +326,7 @@ Call this when starting a new session to ensure no stale state persists."
         pi-coding-agent--local-user-message nil
         pi-coding-agent--extension-status nil
         pi-coding-agent--working-message nil
+        pi-coding-agent--pre-compaction-status nil
         pi-coding-agent--in-code-block nil
         pi-coding-agent--in-thinking-block nil
         pi-coding-agent--thinking-marker nil
@@ -339,6 +340,8 @@ Call this when starting a new session to ensure no stale state persists."
   (pi-coding-agent--clear-unsupported-extension-ui-warnings)
   (pi-coding-agent--invalidate-history-loads)
   ;; Use accessors for cross-module state
+  (pi-coding-agent--cancel-followup-drain-timer)
+  (pi-coding-agent--invalidate-prompt-start-wait)
   (pi-coding-agent--clear-followup-queue)
   (pi-coding-agent--set-aborted nil)
   (pi-coding-agent--set-canonical-messages nil)
@@ -373,7 +376,7 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
         (let ((generation (pi-coding-agent--invalidate-history-loads)))
           (pi-coding-agent--rpc-async proc '(:type "get_messages")
                          (lambda (response)
-                           (when (and (plist-get response :success)
+                           (when (and (eq (plist-get response :success) t)
                                       (buffer-live-p chat-buf))
                              (with-current-buffer chat-buf
                                (when (and (eq pi-coding-agent--process proc)
@@ -400,6 +403,9 @@ ACTION should be a short verb such as resume or fork for user messages."
      ((not (eq pi-coding-agent--status 'idle))
       (message "Pi: Cannot %s while streaming" action)
       nil)
+     ((pi-coding-agent--session-busy-p)
+      (message "Pi: Cannot %s while Pi is busy" action)
+      nil)
      (pi-coding-agent--local-user-message
       (message "Pi: Wait for pi to echo your prompt before you %s" action)
       nil)
@@ -418,7 +424,7 @@ ignored so they cannot overwrite the active session identity."
       (let ((generation (pi-coding-agent--begin-session-transition)))
         (pi-coding-agent--rpc-async proc '(:type "get_state")
           (lambda (response)
-            (when (and (plist-get response :success)
+            (when (and (eq (plist-get response :success) t)
                        (pi-coding-agent--session-transition-current-p
                         chat-buf proc generation))
               (pi-coding-agent--apply-state-response chat-buf response)
@@ -468,7 +474,7 @@ chat buffer from session history."
              new-proc
              (list :type "switch_session" :sessionPath session-file)
              (lambda (response)
-               (if (plist-get response :success)
+               (if (eq (plist-get response :success) t)
                    (progn
                      (pi-coding-agent--refresh-session-state
                       new-proc chat-buf session-file)
@@ -495,7 +501,7 @@ chat buffer from session history."
    (lambda (response)
      (let* ((data (plist-get response :data))
             (cancelled (plist-get data :cancelled)))
-       (if (and (plist-get response :success)
+       (if (and (eq (plist-get response :success) t)
                 (pi-coding-agent--json-false-p cancelled))
            (progn
              (pi-coding-agent--refresh-session-state proc chat-buf selected-path)
@@ -573,7 +579,7 @@ The name is displayed in the resume picker and header-line."
         (pi-coding-agent--rpc-async proc
             (list :type "set_session_name" :name trimmed-name)
             (lambda (response)
-              (if (plist-get response :success)
+              (if (eq (plist-get response :success) t)
                   (progn
                     (when (buffer-live-p chat-buf)
                       (with-current-buffer chat-buf
@@ -641,7 +647,7 @@ Optional INITIAL-INPUT pre-fills the completion prompt for filtering."
                                     :provider provider
                                     :modelId model-id)
                          (lambda (resp)
-                           (when (and (plist-get resp :success)
+                           (when (and (eq (plist-get resp :success) t)
                                       (buffer-live-p chat-buf))
                              (with-current-buffer chat-buf
                                (pi-coding-agent--update-state-from-response resp)
@@ -660,7 +666,7 @@ Unsupported levels are clamped to the current model's capabilities.")
              (chat-buf (pi-coding-agent--get-chat-buffer)))
     (pi-coding-agent--rpc-async proc '(:type "cycle_thinking_level")
                    (lambda (response)
-                     (when (and (plist-get response :success)
+                     (when (and (eq (plist-get response :success) t)
                                 (buffer-live-p chat-buf))
                        (with-current-buffer chat-buf
                          (pi-coding-agent--update-state-from-response response)
@@ -675,7 +681,7 @@ including any model-specific clamping."
   (pi-coding-agent--rpc-async
    proc '(:type "get_state")
    (lambda (response)
-     (if (plist-get response :success)
+     (if (eq (plist-get response :success) t)
          (let* ((data (plist-get response :data))
                 (level (or (plist-get data :thinkingLevel) "off")))
            (pi-coding-agent--apply-state-response chat-buf response)
@@ -704,7 +710,7 @@ including any model-specific clamping."
         (pi-coding-agent--rpc-async
          proc (list :type "set_thinking_level" :level choice)
          (lambda (response)
-           (if (plist-get response :success)
+           (if (eq (plist-get response :success) t)
                (pi-coding-agent--refresh-thinking-level-state proc chat-buf)
              (message "Pi: Failed to set thinking level: %s"
                       (or (plist-get response :error) "unknown error")))))))))
@@ -773,7 +779,7 @@ across restarts."
   (when-let* ((proc (pi-coding-agent--get-process)))
     (pi-coding-agent--rpc-async proc '(:type "get_session_stats")
                    (lambda (response)
-                     (if (plist-get response :success)
+                     (if (eq (plist-get response :success) t)
                          (let ((data (plist-get response :data)))
                            (message "Pi: %s" (pi-coding-agent--format-session-stats data)))
                        (message "Pi: Failed to get session stats"))))))
@@ -802,23 +808,20 @@ Shows PID, status, and session file."
                (or (and session-file (file-name-nondirectory session-file)) "none"))))))
 
 (defun pi-coding-agent--handle-manual-compaction-response (chat-buf response)
-  "Handle manual compaction RESPONSE for CHAT-BUF.
-Restores idle state, renders success details, and drains queued follow-ups."
+  "Handle manual compact command RESPONSE for CHAT-BUF.
+Canonical compaction events render success, failure, and queue effects.
+This callback reports only command-level failure seen before any end event."
   (when (buffer-live-p chat-buf)
     (with-current-buffer chat-buf
-      (setq pi-coding-agent--status 'idle)
-      (pi-coding-agent--set-activity-phase "idle")
-      (if (plist-get response :success)
-          (let ((data (plist-get response :data)))
-            (pi-coding-agent--handle-compaction-success
-             (plist-get data :tokensBefore)
-             (plist-get data :summary)
-             (current-time)))
-        (message "Pi: Compact failed%s"
-                 (if-let* ((error-text (plist-get response :error)))
-                     (format ": %s" error-text)
-                   "")))
-      (pi-coding-agent--process-followup-queue))))
+      (unless (eq (plist-get response :success) t)
+        (when (eq pi-coding-agent--status 'compacting)
+          (setq pi-coding-agent--status 'idle)
+          (pi-coding-agent--set-activity-phase "idle")
+          (pi-coding-agent--restore-followup-queue-to-input)
+          (message "Pi: Compact failed%s"
+                   (if-let* ((error-text (plist-get response :error)))
+                       (format ": %s" error-text)
+                     "")))))))
 
 (defun pi-coding-agent-compact (&optional custom-instructions)
   "Compact conversation context to reduce token usage.
@@ -857,7 +860,7 @@ Optional OUTPUT-PATH specifies where to save; nil uses pi's default."
                              (expand-file-name output-path))
                      '(:type "export_html"))
                    (lambda (response)
-                     (if (plist-get response :success)
+                     (if (eq (plist-get response :success) t)
                          (let* ((data (plist-get response :data))
                                 (path (plist-get data :path)))
                            (message "Pi: Exported to %s" path))
@@ -869,7 +872,7 @@ Optional OUTPUT-PATH specifies where to save; nil uses pi's default."
   (when-let* ((proc (pi-coding-agent--get-process)))
     (pi-coding-agent--rpc-async proc '(:type "get_last_assistant_text")
                    (lambda (response)
-                     (if (plist-get response :success)
+                     (if (eq (plist-get response :success) t)
                          (let* ((data (plist-get response :data))
                                 (text (plist-get data :text)))
                            (if text
@@ -942,7 +945,7 @@ Shows a selector of user messages and creates a fork from the selected one."
     (when (pi-coding-agent--session-transition-ready-p chat-buf "fork")
       (pi-coding-agent--rpc-async proc '(:type "get_fork_messages")
                      (lambda (response)
-                       (if (plist-get response :success)
+                       (if (eq (plist-get response :success) t)
                            (let* ((data (plist-get response :data))
                                   (messages (plist-get data :messages)))
                              ;; Note: messages is a vector from JSON, use seq-empty-p not null
@@ -956,7 +959,7 @@ Shows a selector of user messages and creates a fork from the selected one."
 ORDINAL is the 0-based user turn index.  HEADING-COUNT is the number
 of visible You headings in the buffer.  Returns (ENTRY-ID . PREVIEW)
 or nil if the ordinal could not be mapped."
-  (when (plist-get response :success)
+  (when (eq (plist-get response :success) t)
     (let* ((data (plist-get response :data))
            (messages (append (plist-get data :messages) nil))
            ;; Use last N messages to align with visible headings in
@@ -989,7 +992,7 @@ a preview, then forks.  Only works when the session is idle."
               (user-error "Pi: No active process"))
             (pi-coding-agent--rpc-async proc '(:type "get_fork_messages")
               (lambda (response)
-                (if (not (plist-get response :success))
+                (if (not (eq (plist-get response :success) t))
                     (if-let* ((error-text (plist-get response :error)))
                         (message "Pi: Failed to get fork messages: %s" error-text)
                       (message "Pi: Failed to get fork messages"))
@@ -1012,7 +1015,7 @@ Captures chat and input buffers at call time (before the async RPC)."
         (input-buf (pi-coding-agent--get-input-buffer)))
     (pi-coding-agent--rpc-async proc (list :type "fork" :entryId entry-id)
       (lambda (response)
-        (if (plist-get response :success)
+        (if (eq (plist-get response :success) t)
             (let* ((data (plist-get response :data))
                    (text (plist-get data :text)))
               (pi-coding-agent--refresh-session-state proc chat-buf)
