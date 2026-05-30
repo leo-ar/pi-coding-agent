@@ -349,6 +349,61 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
       (should-not (get-buffer chat-name))
       (should-not (get-buffer input-name)))))
 
+(ert-deftest pi-coding-agent-test-kill-chat-cancelled-preserves-session ()
+  "Killing chat buffer asks before terminating its live process."
+  (let ((prompt-count 0))
+    (pi-coding-agent-test--with-quit-confirmable-session
+        ("/tmp/pi-coding-agent-test-kill-chat-cancel/" chat-name input-name proc)
+      ;; GUI test helpers disable this globally; this test needs the default
+      ;; Emacs process-buffer query to exercise the chat-buffer contract.
+      (let ((kill-buffer-query-functions
+             (if (memq #'process-kill-buffer-query-function
+                       kill-buffer-query-functions)
+                 kill-buffer-query-functions
+               (cons #'process-kill-buffer-query-function
+                     kill-buffer-query-functions))))
+        (cl-letf (((symbol-function 'yes-or-no-p)
+                   (lambda (_)
+                     (cl-incf prompt-count)
+                     nil)))
+          (should-not (kill-buffer chat-name))))
+      (should (= prompt-count 1))
+      (should (get-buffer chat-name))
+      (should (get-buffer input-name))
+      (should (process-live-p proc))
+      (should (process-query-on-exit-flag proc)))))
+
+(ert-deftest pi-coding-agent-test-kill-input-cancelled-preserves-session ()
+  "Killing input buffer asks before terminating the linked live process."
+  (let ((prompt-count 0))
+    (pi-coding-agent-test--with-quit-confirmable-session
+        ("/tmp/pi-coding-agent-test-kill-input-cancel/" chat-name input-name proc)
+      (cl-letf (((symbol-function 'yes-or-no-p)
+                 (lambda (_)
+                   (cl-incf prompt-count)
+                   nil)))
+        (should-not (kill-buffer input-name)))
+      (should (= prompt-count 1))
+      (should (get-buffer chat-name))
+      (should (get-buffer input-name))
+      (should (process-live-p proc))
+      (should (process-query-on-exit-flag proc)))))
+
+(ert-deftest pi-coding-agent-test-kill-input-confirmed-kills-session ()
+  "Confirming input buffer kill terminates the linked session once."
+  (let ((prompt-count 0))
+    (pi-coding-agent-test--with-quit-confirmable-session
+        ("/tmp/pi-coding-agent-test-kill-input-confirm/" chat-name input-name proc)
+      (cl-letf (((symbol-function 'yes-or-no-p)
+                 (lambda (_)
+                   (cl-incf prompt-count)
+                   t)))
+        (should (kill-buffer input-name)))
+      (should (= prompt-count 1))
+      (should-not (get-buffer chat-name))
+      (should-not (get-buffer input-name))
+      (should-not (process-live-p proc)))))
+
 (ert-deftest pi-coding-agent-test-kill-chat-kills-input ()
   "Killing chat buffer also kills input buffer."
   (pi-coding-agent-test-with-mock-session "/tmp/pi-coding-agent-test-linked/"
