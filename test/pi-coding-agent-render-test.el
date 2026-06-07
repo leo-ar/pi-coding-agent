@@ -50,6 +50,7 @@
     (pi-coding-agent--display-message-delta "world!")
     (should (string-match-p "Hello, world!" (buffer-string)))))
 
+
 (ert-deftest pi-coding-agent-test-delta-transforms-atx-headings ()
   "ATX headings in assistant content are leveled down.
 # becomes ##, ## becomes ###, etc. This keeps our setext H1 separators
@@ -611,6 +612,39 @@ agent_end + next section's leading newline must not create triple newlines."
                    "Need to double-check."))
                  text))
         (should-not (string-match-p "> Need to double-check\\." text))))))
+
+(ert-deftest pi-coding-agent-test-display-session-history-batches-postprocessing ()
+  "Session history replay defers per-message display post-processing."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((font-lock-count 0)
+          (table-decoration-count 0))
+      (cl-letf (((symbol-function 'font-lock-ensure)
+                 (lambda (&rest _) (setq font-lock-count (1+ font-lock-count))))
+                ((symbol-function 'pi-coding-agent--decorate-tables-in-region)
+                 (lambda (&rest _) (setq table-decoration-count
+                                          (1+ table-decoration-count)))))
+        (pi-coding-agent--display-session-history
+         [(:role "user"
+           :content [(:type "text" :text "Question?")]
+           :timestamp 1704067200000)
+          (:role "assistant"
+           :content [(:type "text" :text "First answer.")]
+           :timestamp 1704067201000)
+          (:role "compactionSummary"
+           :summary "Summary text"
+           :tokensBefore 1234
+           :timestamp 1704067201500)
+          (:role "custom"
+           :display t
+           :content "Custom note\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+           :timestamp 1704067201750)
+          (:role "assistant"
+           :content [(:type "text" :text "Second answer.")]
+           :timestamp 1704067202000)]
+         (current-buffer)))
+      (should (= font-lock-count 1))
+      (should (= table-decoration-count 1)))))
 
 (ert-deftest pi-coding-agent-test-display-session-history-renders-custom-messages ()
   "Session history replay should preserve visible custom messages."
