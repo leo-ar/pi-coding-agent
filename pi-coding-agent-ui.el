@@ -111,6 +111,27 @@ total window height, e.g. 0.3 means 30% for input."
                  (float :tag "Fraction (0.0–1.0)"))
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-activity-phase-functions nil
+  "Functions called after a session activity phase is applied.
+Each function is called with five arguments:
+
+  CHAT-BUFFER INPUT-BUFFER OLD-PHASE NEW-PHASE REASON
+
+NEW-PHASE is one of \"thinking\", \"replying\", \"running\",
+\"compact\", or \"idle\".  INPUT-BUFFER may be nil or dead during
+session teardown.
+
+REASON is one of `phase-change', `reset', `teardown',
+`input-link', or `input-unlink'.  This lets handlers distinguish a
+real session phase change from buffer lifecycle events that merely
+reapply or clean up buffer-local UI.
+
+This is an abnormal hook.  Functions should be idempotent because
+pi-coding-agent may call them again with the same OLD-PHASE and
+NEW-PHASE when session buffers are relinked or reset."
+  :type 'hook
+  :group 'pi-coding-agent)
+
 (defcustom pi-coding-agent-separator-width 72
   "Total width of section separators in chat buffer."
   :type 'natnum
@@ -908,9 +929,19 @@ so built-in other-window scrolling commands target the linked chat."
 (defvar-local pi-coding-agent--input-buffer nil
   "Reference to the input buffer for this session.")
 
+(defvar pi-coding-agent--activity-phase)
+
 (defun pi-coding-agent--set-input-buffer (buffer)
   "Set the input BUFFER reference for this session."
-  (setq pi-coding-agent--input-buffer buffer))
+  (let ((old-buffer pi-coding-agent--input-buffer)
+        (phase pi-coding-agent--activity-phase))
+    (unless (eq old-buffer buffer)
+      (when (and old-buffer (buffer-live-p old-buffer))
+        (pi-coding-agent--run-activity-phase-functions
+         (current-buffer) old-buffer phase "idle" 'input-unlink))
+      (setq pi-coding-agent--input-buffer buffer)
+      (when (and buffer (buffer-live-p buffer))
+        (pi-coding-agent--set-activity-phase phase 'input-link t)))))
 
 (defvar-local pi-coding-agent--thinking-display nil
   "Completed-thinking display mode for this chat buffer.
@@ -1034,15 +1065,46 @@ One of \"thinking\", \"replying\", \"running\",
 \"compact\", or \"idle\".
 Always populated and rendered in a fixed-width slot.")
 
-(defun pi-coding-agent--set-activity-phase (phase)
+(defun pi-coding-agent--run-activity-phase-functions
+    (chat-buf input-buf old-phase new-phase reason)
+  "Run activity phase functions for CHAT-BUF and INPUT-BUF.
+OLD-PHASE is the previously applied phase.  NEW-PHASE is the phase that
+is now applied.  REASON explains why the application happened.  User functions
+are isolated so a customization error cannot break rendering or state
+transitions."
+  (dolist (fn pi-coding-agent-activity-phase-functions)
+    (condition-case-unless-debug err
+        (funcall fn chat-buf input-buf old-phase new-phase reason)
+      (error
+       (display-warning
+        'pi-coding-agent
+        (format "Activity phase function %S failed: %s"
+                fn (error-message-string err))
+        :error)))))
+
+(defun pi-coding-agent--set-activity-phase (phase &optional reason force)
   "Set activity PHASE for header-line display in current chat buffer.
 PHASE should be one of \"thinking\", \"replying\",
-\"running\", \"compact\", \"idle\".
+\"running\", \"compact\", or \"idle\".  REASON defaults to
+`phase-change'.  When FORCE is non-nil, rerun
+`pi-coding-agent-activity-phase-functions' even if PHASE did not change.
 Returns non-nil when the phase changed."
-  (unless (equal pi-coding-agent--activity-phase phase)
-    (setq pi-coding-agent--activity-phase phase)
-    (force-mode-line-update t)
-    t))
+  (let ((chat-buf (pi-coding-agent--get-chat-buffer))
+        (reason (or reason 'phase-change)))
+    (if (and chat-buf
+             (buffer-live-p chat-buf)
+             (not (eq chat-buf (current-buffer))))
+        (with-current-buffer chat-buf
+          (pi-coding-agent--set-activity-phase phase reason force))
+      (let* ((old-phase pi-coding-agent--activity-phase)
+             (changed (not (equal old-phase phase))))
+        (when (or changed force)
+          (setq pi-coding-agent--activity-phase phase)
+          (when changed
+            (force-mode-line-update t))
+          (pi-coding-agent--run-activity-phase-functions
+           (current-buffer) pi-coding-agent--input-buffer old-phase phase reason))
+        changed))))
 
 (defvar-local pi-coding-agent--cached-stats nil
   "Cached session statistics for header-line display.

@@ -384,6 +384,8 @@ code spans, fenced blocks) while keeping the typed markup characters visible.
 Set =pi-coding-agent-input-markdown-highlighting= to =nil= for plain text input
 buffers in new sessions.
 
+For activity-driven UI customizations, see [[*Activity phase hooks][Activity phase hooks]].
+
 ** Markdown tables
 
 Pipe tables in the chat buffer are beautified as a display-only view.  The
@@ -404,6 +406,83 @@ A chat buffer has one active wrapped width at a time.  That matches the normal
 two-window UI, where each session shows one chat window and one input window.
 If you deliberately show the same chat buffer in multiple windows with
 different widths, one of those widths wins until the next refresh.
+
+* Advanced
+
+** Activity phase hooks
+
+For custom UI changes tied to activity, add functions to
+=pi-coding-agent-activity-phase-functions=.  Each function receives:
+
+#+begin_src emacs-lisp
+(CHAT-BUFFER INPUT-BUFFER OLD-PHASE NEW-PHASE REASON)
+#+end_src
+
+=NEW-PHASE= is one of ="thinking"=, ="replying"=, ="running"=,
+="compact"=, or ="idle"=.  =REASON= explains why the phase was applied:
+
+| Reason         | Meaning                                      |
+|----------------+----------------------------------------------|
+| =phase-change= | The session activity phase changed.          |
+| =reset=        | A session reset forced ="idle"=.             |
+| =teardown=     | Session teardown forced ="idle"=.            |
+| =input-link=   | A newly linked input should apply the phase.  |
+| =input-unlink= | An old input should clean up local UI state.  |
+
+Handlers should be idempotent.  pi-coding-agent may reapply the same phase
+when buffers are relinked, reset, or torn down.  =INPUT-BUFFER= may also be
+nil or dead during teardown.
+
+Tint the input buffer while the session is busy:
+
+#+begin_src emacs-lisp
+(defvar-local my-pi-input-tint-cookie nil)
+
+(defun my-pi-tint-input-while-busy (_chat input _old new _reason)
+  (when (buffer-live-p input)
+    (with-current-buffer input
+      (when my-pi-input-tint-cookie
+        (face-remap-remove-relative my-pi-input-tint-cookie)
+        (setq my-pi-input-tint-cookie nil))
+      (unless (string= new "idle")
+        (setq my-pi-input-tint-cookie
+              (face-remap-add-relative
+               'default :background "gray20"))))))
+
+(add-hook 'pi-coding-agent-activity-phase-functions
+          #'my-pi-tint-input-while-busy)
+#+end_src
+
+Notify when a real session turn finishes.  The =REASON= check matters: input
+relink cleanup also applies ="idle"= to the old input, but that does not mean
+Pi finished working.
+
+#+begin_src emacs-lisp
+(defun my-pi-message-when-done (chat _input old new reason)
+  (when (and (eq reason 'phase-change)
+             (not (string= old "idle"))
+             (string= new "idle"))
+    (message "Pi finished in %s" (buffer-name chat))))
+
+(add-hook 'pi-coding-agent-activity-phase-functions
+          #'my-pi-message-when-done)
+#+end_src
+
+Track busy sessions for your own mode-line or tab display:
+
+#+begin_src emacs-lisp
+(defvar my-pi-busy-sessions nil)
+
+(defun my-pi-track-busy-sessions (chat _input _old new reason)
+  (when (memq reason '(phase-change reset teardown))
+    (setq my-pi-busy-sessions (delq chat my-pi-busy-sessions))
+    (unless (string= new "idle")
+      (push chat my-pi-busy-sessions))
+    (force-mode-line-update t)))
+
+(add-hook 'pi-coding-agent-activity-phase-functions
+          #'my-pi-track-busy-sessions)
+#+end_src
 
 * Development
 

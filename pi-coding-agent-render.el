@@ -1017,6 +1017,7 @@ which asks upfront before any buffers are touched."
   (when (derived-mode-p 'pi-coding-agent-chat-mode)
     (pi-coding-agent--cancel-followup-drain-timer)
     (pi-coding-agent--invalidate-prompt-start-wait)
+    (pi-coding-agent--set-activity-phase "idle" 'teardown t)
     (when pi-coding-agent--process
       (pi-coding-agent--unregister-display-handler pi-coding-agent--process)
       (when (process-live-p pi-coding-agent--process)

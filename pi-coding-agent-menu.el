@@ -363,8 +363,8 @@ Call this when starting a new session to ensure no stale state persists."
         pi-coding-agent--line-parse-state 'line-start
         pi-coding-agent--pending-tool-overlay nil
         pi-coding-agent--tool-block-order-counter 0
-        pi-coding-agent--thinking-block-order-counter 0
-        pi-coding-agent--activity-phase "idle")
+        pi-coding-agent--thinking-block-order-counter 0)
+  (pi-coding-agent--set-activity-phase "idle" 'reset t)
   (pi-coding-agent--clear-unsupported-extension-ui-warnings)
   (pi-coding-agent--invalidate-history-loads)
   ;; Use accessors for cross-module state

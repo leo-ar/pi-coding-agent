@@ -335,6 +335,9 @@ This ensures all files get code fences for consistent display."
 
 ;;; Buffer Linkage
 
+(defvar-local pi-coding-agent-test--activity-marker nil
+  "Buffer-local marker used by activity-phase hook tests.")
+
 (ert-deftest pi-coding-agent-test-input-buffer-finds-chat ()
   "Input buffer can find associated chat buffer."
   (pi-coding-agent-test-with-mock-session "/tmp/pi-coding-agent-test-link1/"
@@ -348,6 +351,164 @@ This ensures all files get code fences for consistent display."
     (with-current-buffer "*pi-coding-agent-chat:/tmp/pi-coding-agent-test-link2/*"
       (should (eq (pi-coding-agent--get-input-buffer)
                   (get-buffer "*pi-coding-agent-input:/tmp/pi-coding-agent-test-link2/*"))))))
+
+(ert-deftest pi-coding-agent-test-activity-phase-functions-receive-session-buffers ()
+  "Activity phase functions receive buffers, phases, and reason."
+  (let ((calls nil)
+        (dir "/tmp/pi-coding-agent-test-activity-hook/"))
+    (pi-coding-agent-test-with-mock-session dir
+      (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir)))
+            (input (get-buffer (pi-coding-agent--buffer-name :input dir)))
+            (pi-coding-agent-activity-phase-functions
+             (list (lambda (chat-buf input-buf old-phase new-phase reason)
+                     (push (list chat-buf input-buf old-phase new-phase reason)
+                           calls)))))
+        (with-current-buffer chat
+          (pi-coding-agent--set-activity-phase "thinking")
+          (pi-coding-agent--set-activity-phase "thinking"))
+        (should (= (length calls) 1))
+        (pcase-let ((`(,seen-chat ,seen-input ,old-phase ,new-phase ,reason)
+                     (car calls)))
+          (should (eq seen-chat chat))
+          (should (eq seen-input input))
+          (should (equal old-phase "idle"))
+          (should (equal new-phase "thinking"))
+          (should (eq reason 'phase-change)))))))
+
+(ert-deftest pi-coding-agent-test-reset-session-state-forces-idle-activity-phase ()
+  "Session reset applies idle even when user display state needs resync."
+  (let ((calls nil)
+        (dir "/tmp/pi-coding-agent-test-activity-reset/"))
+    (pi-coding-agent-test-with-mock-session dir
+      (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir)))
+            (input (get-buffer (pi-coding-agent--buffer-name :input dir)))
+            (pi-coding-agent-activity-phase-functions
+             (list (lambda (chat-buf input-buf old-phase new-phase reason)
+                     (push (list chat-buf input-buf old-phase new-phase reason)
+                           calls)))))
+        (with-current-buffer chat
+          (pi-coding-agent--set-activity-phase "running")
+          (setq calls nil)
+          (pi-coding-agent--reset-session-state))
+        (should (= (length calls) 1))
+        (pcase-let ((`(,seen-chat ,seen-input ,old-phase ,new-phase ,reason)
+                     (car calls)))
+          (should (eq seen-chat chat))
+          (should (eq seen-input input))
+          (should (equal old-phase "running"))
+          (should (equal new-phase "idle"))
+          (should (eq reason 'reset)))))))
+
+(ert-deftest pi-coding-agent-test-set-input-buffer-resyncs-activity-phase ()
+  "Relinking an input buffer reapplies the current activity phase."
+  (let ((calls nil)
+        (dir "/tmp/pi-coding-agent-test-activity-relink/")
+        (new-input (generate-new-buffer " *pi-activity-relink-input*")))
+    (unwind-protect
+        (pi-coding-agent-test-with-mock-session dir
+          (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir)))
+                (pi-coding-agent-activity-phase-functions
+                 (list (lambda (chat-buf input-buf old-phase new-phase reason)
+                         (push (list chat-buf input-buf old-phase new-phase reason)
+                               calls)))))
+            (with-current-buffer chat
+              (pi-coding-agent--set-activity-phase "running")
+              (setq calls nil)
+              (pi-coding-agent--set-input-buffer new-input))
+            (pcase-let ((`(,seen-chat ,seen-input ,old-phase ,new-phase ,reason)
+                         (cl-find-if (lambda (call)
+                                       (eq (cadr call) new-input))
+                                     calls)))
+              (should (eq seen-chat chat))
+              (should (eq seen-input new-input))
+              (should (equal old-phase "running"))
+              (should (equal new-phase "running"))
+              (should (eq reason 'input-link)))))
+      (when (buffer-live-p new-input)
+        (kill-buffer new-input)))))
+
+(ert-deftest pi-coding-agent-test-set-input-buffer-clears-old-input-activity ()
+  "Relinking input buffers lets hooks clean state from the old input."
+  (let ((dir "/tmp/pi-coding-agent-test-activity-relink-cleanup/")
+        (new-input (generate-new-buffer " *pi-activity-relink-cleanup-input*")))
+    (unwind-protect
+        (pi-coding-agent-test-with-mock-session dir
+          (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir)))
+                (old-input (get-buffer (pi-coding-agent--buffer-name :input dir)))
+                (pi-coding-agent-activity-phase-functions
+                 (list (lambda (_chat-buf input-buf _old-phase new-phase reason)
+                         (when (buffer-live-p input-buf)
+                           (with-current-buffer input-buf
+                             (cond
+                              ((eq reason 'input-unlink)
+                               (setq pi-coding-agent-test--activity-marker nil))
+                              ((not (equal new-phase "idle"))
+                               (setq pi-coding-agent-test--activity-marker t)))))))))
+            (with-current-buffer chat
+              (pi-coding-agent--set-activity-phase "running"))
+            (with-current-buffer old-input
+              (should pi-coding-agent-test--activity-marker))
+            (with-current-buffer chat
+              (pi-coding-agent--set-input-buffer new-input))
+            (with-current-buffer old-input
+              (should-not pi-coding-agent-test--activity-marker))
+            (with-current-buffer new-input
+              (should pi-coding-agent-test--activity-marker))))
+      (when (buffer-live-p new-input)
+        (kill-buffer new-input)))))
+
+(ert-deftest pi-coding-agent-test-activity-phase-reason-distinguishes-relink-from-idle ()
+  "Relinking input buffers does not look like a real idle transition."
+  (let ((finished-notifications 0)
+        (dir "/tmp/pi-coding-agent-test-activity-relink-reason/")
+        (new-input (generate-new-buffer " *pi-activity-relink-reason-input*")))
+    (unwind-protect
+        (pi-coding-agent-test-with-mock-session dir
+          (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir)))
+                (pi-coding-agent-activity-phase-functions
+                 (list (lambda (_chat-buf _input-buf old-phase new-phase reason)
+                         (when (and (eq reason 'phase-change)
+                                    (not (equal old-phase "idle"))
+                                    (equal new-phase "idle"))
+                           (setq finished-notifications
+                                 (1+ finished-notifications)))))))
+            (with-current-buffer chat
+              (pi-coding-agent--set-activity-phase "running")
+              (pi-coding-agent--set-input-buffer new-input))
+            (should (= finished-notifications 0))
+            (with-current-buffer chat
+              (pi-coding-agent--set-activity-phase "idle"))
+            (should (= finished-notifications 1))))
+      (when (buffer-live-p new-input)
+        (kill-buffer new-input)))))
+
+(ert-deftest pi-coding-agent-test-chat-buffer-kill-forces-teardown-activity-phase ()
+  "Killing a chat buffer applies idle with teardown as the reason."
+  (let ((calls nil)
+        (dir "/tmp/pi-coding-agent-test-activity-teardown/"))
+    (pi-coding-agent-test-with-mock-session dir
+      (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir)))
+            (input (get-buffer (pi-coding-agent--buffer-name :input dir)))
+            (pi-coding-agent-activity-phase-functions
+             (list (lambda (chat-buf input-buf old-phase new-phase reason)
+                     (push (list chat-buf input-buf old-phase new-phase reason)
+                           calls)))))
+        (with-current-buffer chat
+          (pi-coding-agent--set-activity-phase "running"))
+        (setq calls nil)
+        (kill-buffer chat)
+        (pcase-let ((`(,seen-chat ,seen-input ,old-phase ,new-phase ,reason)
+                     (cl-find-if (lambda (call)
+                                   (and (eq (nth 4 call) 'teardown)
+                                        (equal (nth 2 call) "running")
+                                        (equal (nth 3 call) "idle")))
+                                 calls)))
+          (should (eq seen-chat chat))
+          (should (or (null seen-input)
+                      (eq seen-input input)))
+          (should (equal old-phase "running"))
+          (should (equal new-phase "idle"))
+          (should (eq reason 'teardown)))))))
 
 (ert-deftest pi-coding-agent-test-get-process-from-chat ()
   "Can get process from chat buffer."
