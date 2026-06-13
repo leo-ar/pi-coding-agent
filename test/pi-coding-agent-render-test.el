@@ -1612,28 +1612,27 @@ since we don't display them locally. Let pi's message_start handle it."
   "pi-coding-agent--ms-to-time returns nil when given nil."
   (should (null (pi-coding-agent--ms-to-time nil))))
 
-(ert-deftest pi-coding-agent-test-format-message-timestamp-today ()
-  "Format timestamp shows just time for today."
-  (let ((now (current-time)))
-    (should (string-match-p "^[0-2][0-9]:[0-5][0-9]$"
-                            (pi-coding-agent--format-message-timestamp now)))))
+(ert-deftest pi-coding-agent-test-format-message-timestamp-includes-date-for-today ()
+  "Format timestamp includes ISO date even when the message is from today."
+  (let ((time (encode-time 0 5 10 13 6 2026)))
+    (cl-letf (((symbol-function 'current-time) (lambda () time)))
+      (should (equal (pi-coding-agent--format-message-timestamp time)
+                     "2026-06-13 10:05")))))
 
 (ert-deftest pi-coding-agent-test-format-message-timestamp-other-day ()
-  "Format timestamp shows ISO date and time for other days."
-  (let ((yesterday (time-subtract (current-time) (days-to-time 1))))
-    (should (string-match-p "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\} [0-2][0-9]:[0-5][0-9]$"
-                            (pi-coding-agent--format-message-timestamp yesterday)))))
+  "Format timestamp shows ISO date and time for older messages."
+  (let ((time (encode-time 0 4 9 12 6 2026)))
+    (should (equal (pi-coding-agent--format-message-timestamp time)
+                   "2026-06-12 09:04"))))
 
 (ert-deftest pi-coding-agent-test-display-user-message-with-timestamp ()
   "User message displays with timestamp when provided."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
-    (pi-coding-agent--display-user-message "Test message" (current-time))
+    (let ((time (encode-time 0 5 10 13 6 2026)))
+      (pi-coding-agent--display-user-message "Test message" time))
     (let ((content (buffer-string)))
-      ;; Setext format: "You · HH:MM" on header line
-      (should (string-match-p "You · " content))
-      ;; Should have HH:MM timestamp format
-      (should (string-match-p "[0-2][0-9]:[0-5][0-9]" content)))))
+      (should (string-match-p "You · 2026-06-13 10:05" content)))))
 
 (ert-deftest pi-coding-agent-test-separator-without-timestamp ()
   "Separator without timestamp is setext H1 heading."
@@ -1642,10 +1641,10 @@ since we don't display them locally. Let pi's message_start handle it."
     (should (string-match-p "^You\n=+$" sep))))
 
 (ert-deftest pi-coding-agent-test-separator-with-timestamp ()
-  "Separator with timestamp shows label · time as setext H1."
-  (let ((sep (pi-coding-agent--make-separator "You" (current-time))))
-    ;; Format: "You · HH:MM" followed by newline and ===
-    (should (string-match-p "^You · [0-2][0-9]:[0-5][0-9]\n=+$" sep))))
+  "Separator with timestamp shows label · date and time as setext H1."
+  (let ((sep (pi-coding-agent--make-separator
+              "You" (encode-time 0 5 10 13 6 2026))))
+    (should (string-match-p "^You · 2026-06-13 10:05\n=+$" sep))))
 
 (ert-deftest pi-coding-agent-test-separator-is-valid-setext-heading ()
   "Separator produces valid markdown setext H1 syntax."

@@ -922,6 +922,14 @@ Buffer is read-only with `inhibit-read-only' used for insertion.
     (pi-coding-agent-next-message)
     (should (looking-at "You · 10:10"))))
 
+(ert-deftest pi-coding-agent-test-next-message-recognizes-full-date-heading ()
+  "Message navigation recognizes full-date You headings."
+  (with-temp-buffer
+    (insert "Intro\n\nYou · 2026-06-13 10:05\n========================\nQuestion\n")
+    (goto-char (point-min))
+    (pi-coding-agent-next-message)
+    (should (looking-at "You · 2026-06-13 10:05"))))
+
 (ert-deftest pi-coding-agent-test-next-message-at-last ()
   "n at last You heading keeps point and shows message."
   (with-temp-buffer

@@ -1640,13 +1640,8 @@ Returns nil if MS is nil."
     (error "Unknown time format")))
 
 (defun pi-coding-agent--format-message-timestamp (time)
-  "Format TIME for message headers.
-Shows HH:MM if today, otherwise YYYY-MM-DD HH:MM."
-  (let* ((time-day (format-time-string "%Y-%m-%d" time))
-         (today (format-time-string "%Y-%m-%d" (current-time))))
-    (if (string= time-day today)
-        (format-time-string "%H:%M" time)
-      (format-time-string "%Y-%m-%d %H:%M" time))))
+  "Format TIME for message headers as YYYY-MM-DD HH:MM."
+  (format-time-string "%Y-%m-%d %H:%M" time))
 
 ;;;; Dependency Checking
 
