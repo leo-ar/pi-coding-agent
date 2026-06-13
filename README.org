@@ -33,7 +33,7 @@ is the shortest path to a usable session.
 
 - Emacs 29.1 or later, built with tree-sitter support
 - Node.js 22.19 or later for the pi CLI
-- [[https://pi.dev][pi coding  agent]] =@earendil-works/pi-coding-agent@0.75.5=  or later,
+- [[https://pi.dev][pi coding agent]] =@earendil-works/pi-coding-agent@0.79.1= or later,
   installed and in =PATH=
 - Pi CLI authentication via =pi --login=, or provider API keys
   configured for pi
@@ -102,6 +102,26 @@ or customize =pi-coding-agent-executable=.  An example:
 (setopt pi-coding-agent-executable
         '("npx" "-y" "@earendil-works/pi-coding-agent@latest"))
 #+end_src
+
+*** Project-local Pi resources
+
+Pi does not show its project trust prompt in RPC mode.  To make Emacs
+sessions behave like the usual trusted project workflow,
+=pi-coding-agent= passes =--approve= by default so project-local
+=.pi= prompts, skills, settings, themes, and extensions are active.
+
+Set =pi-coding-agent-project-trust-policy= to =default= to pass no
+trust flag and let Pi use its saved trust decisions and
+=defaultProjectTrust=:
+
+#+begin_src emacs-lisp
+;; Let Pi decide project trust from ~/.pi/agent/trust.json
+;; and its global defaultProjectTrust setting.
+(setopt pi-coding-agent-project-trust-policy 'default)
+#+end_src
+
+Set it to =no-approve= to pass =--no-approve= and ignore
+project-local Pi files for Emacs sessions.
 
 *** Grammar installation fails
 
@@ -256,7 +276,6 @@ Here's some common non-default preferences:
 (setopt pi-coding-agent-visit-file-other-window nil)
 #+end_src
 
-
 Less common tuning knobs:
 
 #+begin_src emacs-lisp
@@ -274,6 +293,9 @@ Less common tuning knobs:
 ;; Keep more recent turns live for table rewrapping and tool overlays:
 ;; Older history is cooled to keep long sessions fast.
 ;; (setopt pi-coding-agent-hot-tail-turn-count 5)
+
+;; Let Pi's saved project trust decisions decide whether .pi resources load:
+;; (setopt pi-coding-agent-project-trust-policy 'default)
 
 ;; Hidden thinking uses generic line-count stubs instead of first-line previews:
 ;; (setopt pi-coding-agent-thinking-hidden-preview nil)
@@ -522,7 +544,7 @@ If you prefer not to install the Pi CLI globally, customize
 
 #+begin_src emacs-lisp
 (setq pi-coding-agent-executable
-      '("npx" "-y" "@earendil-works/pi-coding-agent@0.75.5"))
+      '("npx" "-y" "@earendil-works/pi-coding-agent@0.79.1"))
 #+end_src
 
 * Development

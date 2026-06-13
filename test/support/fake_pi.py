@@ -959,6 +959,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the fake harness."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="rpc", choices=["rpc"])
+    parser.add_argument("--approve", action="store_true")
+    parser.add_argument("--no-approve", action="store_true")
     parser.add_argument("--scenario", required=True)
     parser.add_argument("--scenario-dir", default=str(default_scenario_dir()))
     parser.add_argument("--session-dir")

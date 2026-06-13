@@ -255,14 +255,27 @@ containing EVENT, then clears this process's pending request tables."
       (pi-coding-agent--cleanup-process-stderr-buffer proc))))
 
 (defvar pi-coding-agent-executable)  ; forward decl — core.el cannot require ui.el
+(defvar pi-coding-agent-project-trust-policy) ; forward decl — defined in ui.el
 
 (defvar pi-coding-agent-extra-args nil
   "Extra arguments to pass to the pi command.
-A list of strings that will be appended to the base command.
+A list of strings that will be appended to the base command before the
+project trust flag selected by `pi-coding-agent-project-trust-policy'.
 
 Example: (setq pi-coding-agent-extra-args \\='(\"-e\" \"/path/to/ext.ts\"))
 
 This is useful for testing extensions or passing additional flags.")
+
+(defun pi-coding-agent--project-trust-args ()
+  "Return Pi CLI arguments for `pi-coding-agent-project-trust-policy'."
+  (let ((policy (if (boundp 'pi-coding-agent-project-trust-policy)
+                    pi-coding-agent-project-trust-policy
+                  'approve)))
+    (pcase policy
+      ('approve '("--approve"))
+      ('default nil)
+      ('no-approve '("--no-approve"))
+      (_ (error "Invalid pi-coding-agent-project-trust-policy: %S" policy)))))
 
 (defun pi-coding-agent--start-process (directory)
   "Start pi RPC process in DIRECTORY.
@@ -272,7 +285,10 @@ Returns the process object."
     (condition-case err
         (let ((proc (make-process
                      :name "pi"
-                     :command `(,@pi-coding-agent-executable "--mode" "rpc" ,@pi-coding-agent-extra-args)
+                     :command `(,@pi-coding-agent-executable
+                                "--mode" "rpc"
+                                ,@pi-coding-agent-extra-args
+                                ,@(pi-coding-agent--project-trust-args))
                      :connection-type 'pipe
                      :stderr stderr-buf
                      :filter #'pi-coding-agent--process-filter

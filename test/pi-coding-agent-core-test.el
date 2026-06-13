@@ -727,13 +727,15 @@ Display is handled by the display handler, not by state updates."
 
 ;;;; Executable Customization Tests
 
-(defun pi-coding-agent-test--capture-process-launch (executable extra-args)
+(defun pi-coding-agent-test--capture-process-launch (executable extra-args &optional trust-policy)
   "Return the launch plist that `--start-process' passes to make-process.
 Mocks `make-process' to capture :command and :stderr, binding
-`pi-coding-agent-executable' to EXECUTABLE and
-`pi-coding-agent-extra-args' to EXTRA-ARGS."
+`pi-coding-agent-executable' to EXECUTABLE,
+`pi-coding-agent-extra-args' to EXTRA-ARGS, and
+`pi-coding-agent-project-trust-policy' to TRUST-POLICY or `approve'."
   (let ((pi-coding-agent-executable executable)
         (pi-coding-agent-extra-args extra-args)
+        (pi-coding-agent-project-trust-policy (or trust-policy 'approve))
         (captured nil)
         (dummy-proc (start-process "pi-coding-agent-capture" nil "cat")))
     (unwind-protect
@@ -755,14 +757,28 @@ Mocks `make-process' to capture :command and :stderr, binding
   "start-process builds command from `pi-coding-agent-executable'."
   (should (equal (plist-get (pi-coding-agent-test--capture-process-launch '("npx" "pi") nil)
                             :command)
-                 '("npx" "pi" "--mode" "rpc"))))
+                 '("npx" "pi" "--mode" "rpc" "--approve"))))
 
 (ert-deftest pi-coding-agent-test-start-process-custom-executable-with-extra-args ()
-  "start-process combines custom executable and extra-args."
+  "start-process combines custom executable, trust flag, and extra-args."
   (should (equal (plist-get (pi-coding-agent-test--capture-process-launch
                              '("npx" "pi") '("-e" "/path/to/ext.ts"))
                             :command)
-                 '("npx" "pi" "--mode" "rpc" "-e" "/path/to/ext.ts"))))
+                 '("npx" "pi" "--mode" "rpc" "-e" "/path/to/ext.ts" "--approve"))))
+
+(ert-deftest pi-coding-agent-test-start-process-project-trust-default-omits-flag ()
+  "A `default' project trust policy leaves Pi's own trust default in control."
+  (should (equal (plist-get (pi-coding-agent-test--capture-process-launch
+                             '("pi") nil 'default)
+                            :command)
+                 '("pi" "--mode" "rpc"))))
+
+(ert-deftest pi-coding-agent-test-start-process-project-trust-no-approve-flag ()
+  "A `no-approve' project trust policy tells Pi to ignore project-local files."
+  (should (equal (plist-get (pi-coding-agent-test--capture-process-launch
+                             '("pi") nil 'no-approve)
+                            :command)
+                 '("pi" "--mode" "rpc" "--no-approve"))))
 
 (ert-deftest pi-coding-agent-test-start-process-captures-stderr-separately ()
   "start-process routes stderr away from the JSON-RPC stdout pipe."
