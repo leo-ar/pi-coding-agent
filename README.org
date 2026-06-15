@@ -176,8 +176,8 @@ Type in the input buffer and press =C-c C-c= to send.  If Pi is
 already working, =C-c C-c= queues the text as a follow-up and sends it
 when the current turn finishes.  Press =C-c C-s= while Pi is busy to
 send a steering message: it is delivered after the current tool call
-and interrupts the remaining queued tools.  Press =C-c C-k= to abort a
-streaming response.
+and interrupts the remaining queued tools.  Press =C-c C-k= to abort the
+current response or compaction.
 
 Press =C-c C-p= for the transient menu which allows you to
 conveniently discover commands and shortcuts for model selection,
@@ -256,7 +256,7 @@ and error thresholds.
 |------------------+---------+------------------------------------------------|
 | =C-c C-c=        | input   | 📮 Send prompt, or queue follow-up if busy    |
 | =C-c C-s=        | input   | 🐎 Send steering message while Pi is busy     |
-| =C-c C-k=        | input   | 🪓 Abort streaming                            |
+| =C-c C-k=        | input   | 🪓 Abort current response or compaction       |
 | =C-c C-p=        | input   | 🎛️ Open transient menu                        |
 | =C-c C-r=        | input   | 📼 Resume a previous session                  |
 | =M-p= / =M-n=    | input   | 🕰️ Prompt history (=C-↑= / =C-↓= also work)   |

@@ -33,7 +33,7 @@
 ;;
 ;; Key entry points:
 ;;   `pi-coding-agent-send'                  Send prompt (C-c C-c)
-;;   `pi-coding-agent-abort'                 Abort streaming (C-c C-k)
+;;   `pi-coding-agent-abort'                 Abort current operation (C-c C-k)
 ;;   `pi-coding-agent-quit'                  Close session
 ;;   `pi-coding-agent-previous-input'        History backward (M-p)
 ;;   `pi-coding-agent-next-input'            History forward (M-n)
@@ -332,18 +332,20 @@ The /compact command is handled locally; other slash commands sent to pi."
 
 (defun pi-coding-agent-abort ()
   "Abort the current pi operation.
-Only works when streaming is in progress."
+Works while streaming or compacting."
   (interactive)
   (when-let* ((chat-buf (pi-coding-agent--get-chat-buffer)))
-    (when (eq (buffer-local-value 'pi-coding-agent--status chat-buf) 'streaming)
-      (with-current-buffer chat-buf
-        (pi-coding-agent--set-aborted t))
-      (when-let* ((proc (pi-coding-agent--get-process)))
-        (pi-coding-agent--rpc-async proc
-                       (list :type "abort")
-                       (lambda (_response)
-                         (run-with-timer 2 nil (lambda () (message nil)))
-                         (message "Pi: Aborted")))))))
+    (let ((status (buffer-local-value 'pi-coding-agent--status chat-buf)))
+      (when (memq status '(streaming compacting))
+        (when (eq status 'streaming)
+          (with-current-buffer chat-buf
+            (pi-coding-agent--set-aborted t)))
+        (when-let* ((proc (pi-coding-agent--get-process)))
+          (pi-coding-agent--rpc-async proc
+                         (list :type "abort")
+                         (lambda (_response)
+                           (run-with-timer 2 nil (lambda () (message nil)))
+                           (message "Pi: Aborted"))))))))
 
 (defun pi-coding-agent-quit ()
   "Close the current pi session.

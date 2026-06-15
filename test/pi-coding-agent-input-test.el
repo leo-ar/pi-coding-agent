@@ -728,7 +728,7 @@ Uses :false (JSON false representation) to verify boolean normalization."
 ;;; Abort Command
 
 (ert-deftest pi-coding-agent-test-abort-sends-command ()
-  "pi-coding-agent-abort sends abort command via RPC."
+  "pi-coding-agent-abort sends abort command while streaming."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((sent-command nil)
@@ -738,10 +738,25 @@ Uses :false (JSON false representation) to verify boolean normalization."
                 ((symbol-function 'pi-coding-agent--rpc-async)
                  (lambda (_proc cmd _cb) (setq sent-command cmd))))
         (pi-coding-agent-abort)
-        (should (equal (plist-get sent-command :type) "abort"))))))
+        (should (equal (plist-get sent-command :type) "abort"))
+        (should pi-coding-agent--aborted)))))
 
-(ert-deftest pi-coding-agent-test-abort-noop-when-not-streaming ()
-  "pi-coding-agent-abort does nothing when not streaming."
+(ert-deftest pi-coding-agent-test-abort-sends-command-while-compacting ()
+  "pi-coding-agent-abort sends abort command while compacting."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((sent-command nil)
+          (pi-coding-agent--status 'compacting))
+      (cl-letf (((symbol-function 'pi-coding-agent--get-process) (lambda () 'mock-proc))
+                ((symbol-function 'pi-coding-agent--get-chat-buffer) (lambda () (current-buffer)))
+                ((symbol-function 'pi-coding-agent--rpc-async)
+                 (lambda (_proc cmd _cb) (setq sent-command cmd))))
+        (pi-coding-agent-abort)
+        (should (equal (plist-get sent-command :type) "abort"))
+        (should-not pi-coding-agent--aborted)))))
+
+(ert-deftest pi-coding-agent-test-abort-noop-when-idle ()
+  "pi-coding-agent-abort does nothing when idle."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((sent-command nil)
